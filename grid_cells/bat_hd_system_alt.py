@@ -7,7 +7,7 @@ from .plot_tools import angular_error
 
 def sphere_to_toroid(yaw, pitch):
     pair_1 = np.array([yaw, pitch])
-    pair_2 = np.array([(yaw + np.pi) % (2 * np.pi), (np.pi - pitch) % (2 * np.pi)])
+    pair_2 = np.array([(yaw + 180) % (2 * 180), (180 - pitch) % (2 * 180)])
     return pair_1, pair_2
 
 
@@ -162,7 +162,7 @@ class HeadDirectionNetwork:
         else:
             raise ValueError("WTF?")
 
-        target_gain = np.asarray(self.shape) / (2 * np.pi) * revolutions
+        target_gain = np.asarray(self.shape) / (2 * 180) * revolutions
         dist_list = []
         for n in self.shape:
             idx = np.arange(n)
@@ -234,9 +234,9 @@ class HeadDirectionNetwork:
                 s, axis=tuple([i for i in range(len(shape)) if i != axis_iter])
             )
 
-            mean_x_angle = np.angle(np.sum(profile_x * np.exp(1j * x_phases)))
+            mean_x_angle = np.rad2deg(np.angle(np.sum(profile_x * np.exp(1j * x_phases))))
 
-            angle_1 = (-mean_x_angle + 2 * np.pi) % (2 * np.pi)
+            angle_1 = (-mean_x_angle + 2 * 180) % (2 * 180)
             angle_list.append(angle_1)
 
         return np.array(angle_list)
@@ -256,12 +256,12 @@ class HeadDirectionNetwork:
 
         phases_list = []
         for nx in shape:
-            x_phases = 2 * np.pi * np.arange(nx) / nx
+            x_phases = 2 * 180 * np.arange(nx) / nx
             phases_list.append(x_phases)
         X = np.meshgrid(*phases_list, indexing="ij")
         X = np.stack(X, axis=-1)
 
-        dx = np.arctan2(np.sin(-(X + target_angles)), np.cos(-(X + target_angles)))
+        dx = np.rad2deg(np.arctan2(np.sin(np.deg2rad(-(X + target_angles))), np.cos(np.deg2rad(-(X + target_angles))))) / 180
 
         s_2d = np.exp(-(np.sum(dx**2, axis=-1)) / (2 * width**2))
 
@@ -272,7 +272,7 @@ class BatHeadDirectionSystem:
 
     def __init__(
         self,
-        n_conjunctive=5,
+        n_conjunctive=(10,5),
         n_yaw=256,
         n_pitch=256,
         tau=10e-3,
@@ -319,12 +319,12 @@ class BatHeadDirectionSystem:
         self.eps = eps
         self.learn_rate = 5e-2
 
-        self.n_conjunctive = n_conjunctive
+        self.n_conjunctive_total = np.prod(n_conjunctive)
+        self.n_conj_yaw = n_conjunctive[0]
+        self.n_conj_pitch = n_conjunctive[1]
         self.n_yaw = n_yaw
         self.n_pitch = n_pitch
         self.rng = rng
-        self.activation_sigma = 0.2
-        self.connectivity_sigma = 0.2
         self.connect_vc_directly = connect_vc_directly
         self.gravity_gated = gravity_gated
 
@@ -333,36 +333,38 @@ class BatHeadDirectionSystem:
         self.feedback_strength = feedback_strength
         self.inhibition = 1
 
-        self.visual_trace = np.zeros(n_conjunctive, dtype=float)
-        self.conjunctive_neurons = np.zeros(n_conjunctive, dtype=float)
+        self.visual_trace = np.zeros(self.n_conjunctive_total, dtype=float)
+        self.conjunctive_neurons = np.zeros(self.n_conjunctive_total, dtype=float)
 
-        raw_yaw_conj_w = np.zeros((n_conjunctive, n_yaw), dtype=float)
-        raw_pitch_conj_w = np.zeros((n_conjunctive, n_pitch), dtype=float)
-        self.conjunctive_angels = np.stack(
-            [
-                rng.uniform(0, 2 * np.pi, size=(n_conjunctive,)),
-                rng.uniform(-np.pi / 2, np.pi / 2, size=(n_conjunctive,)),
-            ],
-            axis=-1,
-        )
+        raw_yaw_conj_w = np.zeros((self.n_conjunctive_total, n_yaw), dtype=float)
+        raw_pitch_conj_w = np.zeros((self.n_conjunctive_total, n_pitch), dtype=float)
+        yaw_range = (0, 2 * 180)
+        pitch_range = (-180 / 2, 180 / 2)
+        yaw_linspace = np.linspace(yaw_range[0], yaw_range[1], self.n_conj_yaw, endpoint=False)
+        pitch_linspace = np.linspace(pitch_range[0], pitch_range[1], self.n_conj_pitch, endpoint=False)
+        self.conjunctive_angels = np.array(np.meshgrid(yaw_linspace, pitch_linspace)).T.reshape(-1, 2)
+        self.activation_sigma = np.array([2 /self.n_conj_yaw, 1 / self.n_conj_pitch])
+        self.connectivity_sigma = np.array([2 / self.n_conj_yaw, 1 /self.n_conj_pitch])
+
+
 
         for neuron_index, [azimuth, polar] in enumerate(self.conjunctive_angels):
             raw_yaw_conj_w[neuron_index] = self.yaw_ring.encode_orientation(
-                azimuth, self.connectivity_sigma
+                azimuth, self.connectivity_sigma[0]
             )
             raw_pitch_conj_w[neuron_index] = self.pitch_ring.encode_orientation(
-                polar, self.connectivity_sigma
+                polar, self.connectivity_sigma[1]
             )
 
-        raw_yaw_anchor_w = np.zeros((n_yaw, n_conjunctive), dtype=float)
-        raw_pitch_anchor_w = np.zeros((n_pitch, n_conjunctive), dtype=float)
+        raw_yaw_anchor_w = np.zeros((n_yaw, self.n_conjunctive_total), dtype=float)
+        raw_pitch_anchor_w = np.zeros((n_pitch, self.n_conjunctive_total), dtype=float)
 
         for neuron_index, [azimuth, polar] in enumerate(self.conjunctive_angels):
             raw_yaw_anchor_w[..., neuron_index] = self.yaw_ring.encode_orientation(
-                azimuth, self.connectivity_sigma
+                azimuth, self.connectivity_sigma[0]
             )
             raw_pitch_anchor_w[..., neuron_index] = self.pitch_ring.encode_orientation(
-                polar, self.connectivity_sigma
+                polar, self.connectivity_sigma[1]
             )
 
         self._yaw_fwd = raw_yaw_conj_w
@@ -374,8 +376,8 @@ class BatHeadDirectionSystem:
         self.intrinsic_noise = intrinsic_noise
         self.input_noise = input_noise
 
-        self.speed_gate_k = 2
-        self.speed_gate_thr = 1
+        self.speed_gate_k = 1 / 50
+        self.speed_gate_thr = 50
 
     def normalisze_anchors(self):
         self._yaw_anchor_w /= np.clip(
@@ -387,8 +389,8 @@ class BatHeadDirectionSystem:
 
     def activation_weight_func(self, position, anchor):
         err = angular_error(position, anchor)
-        d2 = np.sum(err**2, axis=-1)
-        return np.exp(-d2 / (2 * self.activation_sigma**2))
+        d2 = err**2
+        return np.exp(np.sum(-d2 / (2 * self.activation_sigma**2),axis=-1))
 
     def step(
         self,
@@ -541,7 +543,7 @@ class BatHeadDirectionSystem:
         output_dict["anchor_angles"] = self.conjunctive_angels
 
         output_dict["conj_cells"] = np.zeros(
-            (record_steps, self.n_conjunctive), dtype=float
+            (record_steps, self.n_conjunctive_total), dtype=float
         )
         output_dict["yaw_cells"] = np.zeros((record_steps, self.n_yaw), dtype=float)
         output_dict["pitch_cells"] = np.zeros((record_steps, self.n_pitch), dtype=float)

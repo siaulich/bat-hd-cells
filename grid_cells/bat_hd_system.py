@@ -7,7 +7,7 @@ from .plot_tools import angular_error
 
 def sphere_to_toroid(yaw, pitch):
     pair_1 = np.array([yaw, pitch])
-    pair_2 = np.array([(yaw + np.pi) % (2 * np.pi), (np.pi - pitch) % (2 * np.pi)])
+    pair_2 = np.array([(yaw + 180) % (2 * 180), (180 - pitch) % (2 * 180)])
     return pair_1, pair_2
 
 
@@ -162,7 +162,7 @@ class HeadDirectionNetwork:
         else:
             raise ValueError("WTF?")
 
-        target_gain = np.asarray(self.shape) / (2 * np.pi) * revolutions
+        target_gain = np.asarray(self.shape) / (2 * 180) * revolutions
         dist_list = []
         for n in self.shape:
             idx = np.arange(n)
@@ -234,9 +234,9 @@ class HeadDirectionNetwork:
                 s, axis=tuple([i for i in range(len(shape)) if i != axis_iter])
             )
 
-            mean_x_angle = np.angle(np.sum(profile_x * np.exp(1j * x_phases)))
+            mean_x_angle = np.rad2deg(np.angle(np.sum(profile_x * np.exp(1j * x_phases))))
 
-            angle_1 = (-mean_x_angle + 2 * np.pi) % (2 * np.pi)
+            angle_1 = (-mean_x_angle + 2 * 180) % (2 * 180)
             angle_list.append(angle_1)
 
         return np.array(angle_list)
@@ -256,12 +256,12 @@ class HeadDirectionNetwork:
 
         phases_list = []
         for nx in shape:
-            x_phases = 2 * np.pi * np.arange(nx) / nx
+            x_phases = 2 * 180 * np.arange(nx) / nx
             phases_list.append(x_phases)
         X = np.meshgrid(*phases_list, indexing="ij")
         X = np.stack(X, axis=-1)
 
-        dx = np.arctan2(np.sin(-(X + target_angles)), np.cos(-(X + target_angles)))
+        dx = np.arctan2(np.sin(np.deg2rad(-(X + target_angles))), np.cos(np.deg2rad(-(X + target_angles))))
 
         s_2d = np.exp(-(np.sum(dx**2, axis=-1)) / (2 * width**2))
 
@@ -273,7 +273,7 @@ class BatHeadDirectionSystem:
     def __init__(
         self,
         n_conjunctive=5,
-        n_anchor=5,
+        n_anchor=(8, 4),
         n_yaw=256,
         n_pitch=256,
         tau=10e-3,
@@ -287,6 +287,7 @@ class BatHeadDirectionSystem:
         gravity_gated=False,
         ignore_inversion=False,
         anchor_strength = 1,
+        feedback_strength = 1,
         **kwargs,
     ):
         rng = rng or np.random.default_rng(seed=0)
@@ -307,9 +308,10 @@ class BatHeadDirectionSystem:
             dt,
             intrinsic_noise,
             input_noise,
-            size,
+            size/2,
             use_single_bump=True,
             rng=rng,
+            revolutions=1,
             **kwargs,
         )
         self.tau = tau
@@ -327,18 +329,18 @@ class BatHeadDirectionSystem:
         self.n_yaw = n_yaw
         self.n_pitch = n_pitch
         self.rng = rng
-        self.activation_sigma = 0.1
         self.connectivity_sigma = 0.1
 
         self.forward_strength = 1
-        self.anchor_strength = anchor_strength  # if gravity_gated else 0.5
+        self.anchor_strength = anchor_strength
+        self.feedback_strength = feedback_strength 
         self.inhibition = 1
 
         self.conjunctive_neurons = np.zeros(n_conjunctive, dtype=float)
 
         raw_yaw_conj_w = np.zeros((n_conjunctive, n_yaw), dtype=float)
         raw_pitch_conj_w = np.zeros((n_conjunctive, n_pitch), dtype=float)
-        self.conjunctive_angels = rng.uniform(0, 2 * np.pi, size=(n_conjunctive, 2))
+        self.conjunctive_angels = rng.uniform(0, 2 * 180, size=(n_conjunctive, 2))
 
         for neuron_index, [yaw, pitch] in enumerate(self.conjunctive_angels):
             raw_yaw_conj_w[neuron_index] = self.yaw_ring.encode_orientation(
@@ -350,26 +352,23 @@ class BatHeadDirectionSystem:
         self._yaw_fwd = raw_yaw_conj_w
         self._pitch_fwd = raw_pitch_conj_w
 
-        upward_clearence = 0.5
-        self.anchor_angles = np.stack(
-            [
-                rng.uniform(
-                    low=0,
-                    high=2 * np.pi,
-                    size=(n_anchor),
-                ),
-                rng.uniform(
-                    low=-upward_clearence * np.pi / 2,
-                    high=upward_clearence * np.pi / 2,
-                    size=(n_anchor),
-                ),  # * (1 - 2* rng.integers(0,1,size=(n_anchor)))
-            ],
-            axis=-1,
-        )
+
+        self.n_anchor_total = np.prod(n_anchor)
+        self.n_anchor_yaw = n_anchor[0]
+        self.n_anchor_pitch = n_anchor[1]
+
+        yaw_range = (0, 2 * 180)
+        pitch_range = (-70, 70)
+        yaw_linspace = np.linspace(yaw_range[0], yaw_range[1], self.n_anchor_yaw, endpoint=False)
+        pitch_linspace = np.linspace(pitch_range[0], pitch_range[1], self.n_anchor_pitch, endpoint=False)
+        self.anchor_angles = np.array(np.meshgrid(yaw_linspace, pitch_linspace)).T.reshape(-1, 2)
+        self.activation_sigma = np.array([2 /self.n_anchor_yaw, 1 / self.n_anchor_pitch])
+
+
         if self.gravity_gated:
-            self.visual_trace = np.zeros((n_anchor, 1), dtype=float)
+            self.visual_trace = np.zeros((self.n_anchor_total, 1), dtype=float)
         else:
-            self.visual_trace = np.zeros((n_anchor, 2), dtype=float)
+            self.visual_trace = np.zeros((self.n_anchor_total, 2), dtype=float)
 
         raw_yaw_anchor_w = rng.uniform(size=(n_yaw, *self.visual_trace.shape))
         raw_pitch_anchor_w = rng.uniform(size=(n_pitch, *self.visual_trace.shape))
@@ -384,8 +383,8 @@ class BatHeadDirectionSystem:
         self.intrinsic_noise = intrinsic_noise
         self.input_noise = input_noise
 
-        self.speed_gate_k = 1
-        self.speed_gate_thr = 1
+        self.speed_gate_k = 1 / 50
+        self.speed_gate_thr = 50
 
     def normalisze_anchors(self):
         self._yaw_anchor_w /= np.clip(
@@ -397,8 +396,8 @@ class BatHeadDirectionSystem:
 
     def activation_weight_func(self, position, anchor):
         err = angular_error(position, anchor)
-        d2 = np.sum(err**2, axis=-1)
-        return np.exp(-d2 / (2 * self.activation_sigma**2))
+        d2 = err**2
+        return np.exp(np.sum(-d2 / (2 * self.activation_sigma**2), axis=-1))
 
     def step(
         self,
@@ -414,15 +413,13 @@ class BatHeadDirectionSystem:
         else:
             raw_visual = np.zeros_like(self.visual_trace)
 
+        inverted = inverted if inverted is not None else False
+
         if not self.gravity_gated:
-            upright = np.array([True, False], dtype=bool)[np.newaxis, :] ^ (
-                inverted if inverted is not None else False
-            )
+            upright = np.array([True, False], dtype=bool)[np.newaxis, :] ^ inverted
             upright = upright.astype(float)
         else:
-            upright = np.array([True], dtype=bool)[np.newaxis, :] ^ (
-                inverted if inverted is not None else False
-            )
+            upright = np.array([True], dtype=bool)[np.newaxis, :] ^ inverted
             upright = upright.astype(float)
 
         speed = np.linalg.norm(v)
@@ -430,7 +427,7 @@ class BatHeadDirectionSystem:
             1.0 + np.exp(self.speed_gate_k * (speed - self.speed_gate_thr))
         )
 
-        raw_visual = upright * raw_visual * anchor_modulation
+        raw_visual = upright * raw_visual * anchor_modulation * self.feedback_strength
 
         yaw_ring = self.yaw_ring.s.copy()
         pitch_ring = self.pitch_ring.s.copy()
@@ -457,7 +454,7 @@ class BatHeadDirectionSystem:
         yaw_overlap = np.dot(self._yaw_fwd, self.yaw_ring.s)
         pitch_overlap = np.dot(self._pitch_fwd, self.pitch_ring.s)
         forward_input = self.forward_strength * (yaw_overlap + pitch_overlap)
-        total_input = forward_input - self.inhibition
+        total_input = (forward_input - self.inhibition) * 2
 
         self.conjunctive_neurons = (
             self.conjunctive_neurons
@@ -477,12 +474,12 @@ class BatHeadDirectionSystem:
         )
         pi_anchor_input = self.anchor_strength * np.sum(
             self._pitch_anchor_w * self.visual_trace, axis=(-1, -2)
-        )
+        ) * 1/2
         self._yaw_anchor_w += yaw_anchor_weight_update * self.dt
         self._pitch_anchor_w += pitch_anchor_weight_update * self.dt
         self.normalisze_anchors()
         self.yaw_ring.step(v[0], anchor_input=yw_anchor_input)
-        self.pitch_ring.step((1 - 2 * upright.flatten()) * v[1], anchor_input=pi_anchor_input)
+        self.pitch_ring.step(v[1], anchor_input=pi_anchor_input)
 
     def warm_up(
         self, tol=1e-5, max_iter=100000, initial_dir: np.ndarray = np.array([0, 0])
