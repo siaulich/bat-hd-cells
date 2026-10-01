@@ -233,7 +233,9 @@ class HeadDirectionNetwork:
                 s, axis=tuple([i for i in range(len(shape)) if i != axis_iter])
             )
 
-            mean_x_angle = np.rad2deg(np.angle(np.sum(profile_x * np.exp(1j * x_phases))))
+            mean_x_angle = np.rad2deg(
+                np.angle(np.sum(profile_x * np.exp(1j * x_phases)))
+            )
 
             angle_1 = (-mean_x_angle + 2 * 180) % (2 * 180)
             angle_list.append(angle_1)
@@ -260,7 +262,12 @@ class HeadDirectionNetwork:
         X = np.meshgrid(*phases_list, indexing="ij")
         X = np.stack(X, axis=-1)
 
-        dx = np.rad2deg(np.arctan2(np.sin(np.deg2rad(-(X + target_angles))), np.cos(np.deg2rad(-(X + target_angles)))))
+        dx = np.rad2deg(
+            np.arctan2(
+                np.sin(np.deg2rad(-(X + target_angles))),
+                np.cos(np.deg2rad(-(X + target_angles))),
+            )
+        )
 
         s_2d = np.exp(-(np.sum(dx**2, axis=-1)) / (2 * width**2))
 
@@ -268,13 +275,14 @@ class HeadDirectionNetwork:
 
 
 class BatHeadDirectionSystem:
-    # Angular layout (degrees)
+
     YAW_RANGE = (0, 2 * 180)
     PITCH_RANGE = (-70, 70)
 
     def __init__(
         self,
         n_conjunctive=(10, 5),
+        n_landmark=10,
         n_yaw=256,
         n_pitch=256,
         tau=10e-3,
@@ -284,16 +292,15 @@ class BatHeadDirectionSystem:
         size=1 / 3,
         tau_visual=None,
         eps=1e-8,
-        forward_strength=0.7,
-        anchor_strength=0.8,
+        forward_strength=0.8,
+        backward_strength=0.8,
         feedback_strength=1,
-        random_angles=False,
-        conj_gain=1,
-        connect_vc_directly=False,
+        visual_drive=1,
+        conj_gain=1.5,
         learn_weights=False,
-        tie_weights=False,
-        weight_init=None,
         gravity_gated=False,
+        vision_gated=False,
+        shunting_inhibition=True,
         rng: np.random.Generator = None,
         **kwargs,
     ):
@@ -325,88 +332,88 @@ class BatHeadDirectionSystem:
             rng=rng,
             **{"revolutions": 1, **kwargs},
         )
-        self.tau = tau
         self.dt = dt
+        self.tau = tau
         self.tau_visual = tau_visual if tau_visual is not None else 2 * tau
+        self.tau_conj = tau / 3
         self.eps = eps
         self.learn_rate = 5e-2
 
         self.gravity_gated = gravity_gated
-        self.connect_vc_directly = connect_vc_directly
+        self.vision_gated = vision_gated
         self.learn_weights = learn_weights
-        self.tie_weights = tie_weights
 
+        self.n_conj_yaw, self.n_conj_pitch = n_conjunctive
+        self.n_landmark = n_landmark
         self.n_yaw = n_yaw
         self.n_pitch = n_pitch
+
         self.rng = rng
         self.intrinsic_noise = intrinsic_noise
         self.input_noise = input_noise
 
         self.forward_strength = forward_strength
-        self.anchor_strength = anchor_strength
+        self.backward_strength = backward_strength
+        self.visual_drive = visual_drive
         self.feedback_strength = feedback_strength
         self.conj_gain = conj_gain
         self.inhibition = 1
+        self.sigma_div = 0.1
+        self.div_strength = 1.0
+        self.shunting_inhibition = shunting_inhibition
 
-        # ---- single conjunctive / anchor population on a (yaw, pitch) grid -------
+
+
+        self.landmark_angles = np.stack(
+            [
+                rng.uniform(*self.YAW_RANGE, size=n_landmark),
+                rng.uniform(*self.PITCH_RANGE, size=n_landmark),
+            ],
+            axis=-1,
+        )
+
         if np.isscalar(n_conjunctive) or len(n_conjunctive) != 2:
-            raise ValueError("n_conjunctive must be a (n_yaw_cells, n_pitch_cells) grid")
-        self.n_conj_yaw, self.n_conj_pitch = n_conjunctive
-        self.n_conjunctive_total = int(self.n_conj_yaw * self.n_conj_pitch)
-        self.n_conjunctive = self.n_conjunctive_total
-        if random_angles:
-            self.conjunctive_angels = np.column_stack(
-                (
-                    rng.uniform(*self.YAW_RANGE, self.n_conjunctive_total),
-                    rng.uniform(*self.PITCH_RANGE, self.n_conjunctive_total),
-                )
+            raise ValueError(
+                "n_conjunctive must be a (n_yaw_cells, n_pitch_cells) grid"
             )
-        else:
-            yaw_linspace = np.linspace(*self.YAW_RANGE, self.n_conj_yaw, endpoint=False)
-            pitch_linspace = np.linspace(*self.PITCH_RANGE, self.n_conj_pitch, endpoint=True)
-            self.conjunctive_angels = np.array(
-                np.meshgrid(yaw_linspace, pitch_linspace)
-            ).T.reshape(-1, 2)
+        yaw_linspace = np.linspace(*self.YAW_RANGE, self.n_conj_yaw, endpoint=False)
+        pitch_linspace = np.linspace(
+            *self.PITCH_RANGE, self.n_conj_pitch, endpoint=True
+        )
+        self.conjunctive_angels = np.array(np.meshgrid(yaw_linspace, pitch_linspace)).T
+        self.activation_sigma = np.array((0.1, 0.1))
+        self.connectivity_sigma = 180 * np.array(
+            [2 / self.n_conj_yaw, 1 / self.n_conj_pitch]
+        )
 
-
-        self.activation_sigma = np.array([2 / self.n_conj_yaw, 1 / self.n_conj_pitch])
-        self.connectivity_sigma = 180 * self.activation_sigma
-
-        self.visual_trace = np.zeros(self.n_conjunctive_total, dtype=float)
-        self.conjunctive_neurons = np.zeros(self.n_conjunctive_total, dtype=float)
+        self.visual_trace = np.zeros(n_landmark, dtype=float)
+        self.conjunctive_neurons = np.zeros(
+            (self.n_conj_yaw, self.n_conj_pitch), dtype=float
+        )
 
         # ---- ring -> cell weights (fixed) ---------------------------------------
-        raw_yaw_conj_w = np.zeros((self.n_conjunctive_total, n_yaw), dtype=float)
-        raw_pitch_conj_w = np.zeros((self.n_conjunctive_total, n_pitch), dtype=float)
-        for i, [yaw, pitch] in enumerate(self.conjunctive_angels):
-            raw_yaw_conj_w[i] = self.yaw_ring.encode_orientation(
-                yaw, self.connectivity_sigma[0]
-            )
-            raw_pitch_conj_w[i] = self.pitch_ring.encode_orientation(
-                pitch, self.connectivity_sigma[1]
-            )
-        # ---- ring <-> cell weights (optionally learned) -------------------------
-        if weight_init is None:
-            weight_init = "random" if learn_weights else "aligned"
-        self.weight_init = weight_init
-        if weight_init == "aligned":
-            self._yaw_fwd = raw_yaw_conj_w.copy()
-            self._pitch_fwd = raw_pitch_conj_w.copy()
-            self._yaw_anchor_w = raw_yaw_conj_w.T.copy()
-            self._pitch_anchor_w = raw_pitch_conj_w.T.copy()
-        elif weight_init == "random":
-            self._yaw_anchor_w = rng.uniform(size=(n_yaw, self.n_conjunctive_total))
-            self._pitch_anchor_w = rng.uniform(size=(n_pitch, self.n_conjunctive_total))
-            self.normalisze_anchors()
-            self._yaw_anchor_w *= 0.1
-            self._pitch_anchor_w *= 0.1
-            self._yaw_fwd = rng.uniform(size=(self.n_conjunctive_total, n_yaw))
-            self._pitch_fwd = rng.uniform(size=(self.n_conjunctive_total, n_pitch))
-            self.normalise_forward()
-            self._yaw_fwd *= 0.1
-            self._pitch_fwd *= 0.1
-        else:
-            raise ValueError("weight_init must be 'aligned', 'random' or None")
+        raw_yaw_conj_w = np.zeros(
+            (self.n_conj_yaw, self.n_conj_pitch, n_yaw), dtype=float
+        )
+        raw_pitch_conj_w = np.zeros(
+            (self.n_conj_yaw, self.n_conj_pitch, n_pitch), dtype=float
+        )
+        for i, yaw in enumerate(yaw_linspace):
+            for j, pitch in enumerate(pitch_linspace):
+                raw_yaw_conj_w[i, j] = self.yaw_ring.encode_orientation(
+                    yaw, self.connectivity_sigma[0]
+                )
+                raw_pitch_conj_w[i, j] = self.pitch_ring.encode_orientation(
+                    pitch, self.connectivity_sigma[1]
+                )
+        self._yaw_conj_w = raw_yaw_conj_w.copy()
+        self._pitch_conj_w = raw_pitch_conj_w.copy()
+
+        self._feedback_w = rng.uniform(
+            size=(self.n_conj_yaw, self.n_conj_pitch, n_landmark)
+        )
+        self.normalize_feedback_weight()
+        self._feedback_w *= 0.1
 
         self.speed_gate_k = 1 / 50
         self.speed_gate_thr = 50
@@ -420,25 +427,23 @@ class BatHeadDirectionSystem:
         self.yaw_ring.intrinsic_noise = self.intrinsic_noise
         self.pitch_ring.intrinsic_noise = self.intrinsic_noise
 
-    def normalisze_anchors(self):
-        self._yaw_anchor_w /= np.clip(
-            np.sum(self._yaw_anchor_w, axis=0, keepdims=True), 1, None
-        )
-        self._pitch_anchor_w /= np.clip(
-            np.sum(self._pitch_anchor_w, axis=0, keepdims=True), 1, None
-        )
-
-    def normalise_forward(self):
-        # same constraint as the anchor weights: per cell, summed over ring units
-        self._yaw_fwd /= np.clip(np.sum(self._yaw_fwd, axis=1, keepdims=True), 1, None)
-        self._pitch_fwd /= np.clip(
-            np.sum(self._pitch_fwd, axis=1, keepdims=True), 1, None
+    def normalize_feedback_weight(self):
+        self._feedback_w = self._feedback_w / (
+            np.clip(
+                np.sum(
+                    self._feedback_w,
+                    axis=tuple(range(self._feedback_w.ndim - 1)),
+                    keepdims=True,
+                ),
+                1,
+                None,
+            )
         )
 
-    def _forward_weights(self):
-        if self.tie_weights:
-            return self._yaw_anchor_w.T, self._pitch_anchor_w.T
-        return self._yaw_fwd, self._pitch_fwd
+    def _backward_weights(self):
+        return self._yaw_conj_w.transpose(2, 0, 1), self._pitch_conj_w.transpose(
+            2, 0, 1
+        )
 
     def activation_weight_func(self, position, anchor):
         err = angular_error(position, anchor)
@@ -453,7 +458,7 @@ class BatHeadDirectionSystem:
     ):
         if dir is not None:
             raw_visual = self.activation_weight_func(
-                self.conjunctive_angels,
+                self.landmark_angles,
                 dir[np.newaxis, :],
             )
         else:
@@ -469,57 +474,51 @@ class BatHeadDirectionSystem:
             1.0 + np.exp(self.speed_gate_k * (speed - self.speed_gate_thr))
         )
 
-        raw_visual = self.feedback_strength * raw_visual * anchor_modulation * upright
-
-        # activity that feeds back to the rings (and drives learning)
-        feedback = self.visual_trace if self.connect_vc_directly else self.conjunctive_neurons
+        raw_visual = self.visual_drive * raw_visual * anchor_modulation * upright
 
         conj_noise_term = 0.0
         visual_noise_term = 0.0
         if self.intrinsic_noise:
-            noise_amp = self.intrinsic_noise * np.sqrt(self.dt / self.tau)
+            noise_amp = self.intrinsic_noise * np.sqrt(self.dt / self.tau_conj)
             conj_noise_term = noise_amp * self.rng.normal(
                 size=self.conjunctive_neurons.shape
             )
 
-        yaw_fwd, pitch_fwd = self._forward_weights()
-        yaw_overlap = np.dot(yaw_fwd, self.yaw_ring.s)
-        pitch_overlap = np.dot(pitch_fwd, self.pitch_ring.s)
+        yaw_overlap = np.dot(self._yaw_conj_w, self.yaw_ring.s)
+        pitch_overlap = np.dot(self._pitch_conj_w, self.pitch_ring.s)
         forward_input = self.forward_strength * (yaw_overlap + pitch_overlap)
-        if not self.connect_vc_directly:
-            forward_input = forward_input + self.visual_trace
-        total_input = (forward_input - self.inhibition) * self.conj_gain
 
-        yw_anchor_input = self.anchor_strength * np.sum(
-            self._yaw_anchor_w * feedback, axis=-1
-        )
-        pi_anchor_input = (
-            self.anchor_strength
-            * np.sum(self._pitch_anchor_w * feedback, axis=-1)
+        visual_input = self.feedback_strength * np.dot(
+            self._feedback_w, self.visual_trace
         )
 
-        if self.learn_weights:
-            self._yaw_anchor_w += (
-                self.learn_rate * self.yaw_ring.s[:, np.newaxis] * feedback[np.newaxis, :]
-            ) * self.dt
-            self._pitch_anchor_w += (
-                self.learn_rate * self.pitch_ring.s[:, np.newaxis] * feedback[np.newaxis, :]
-            ) * self.dt
-            self.normalisze_anchors()
-            if not self.tie_weights:
-                cells = self.conjunctive_neurons
-                self._yaw_fwd += (
-                    self.learn_rate * cells[:, np.newaxis] * self.yaw_ring.s[np.newaxis, :]
-                ) * self.dt
-                self._pitch_fwd += (
-                    self.learn_rate * cells[:, np.newaxis] * self.pitch_ring.s[np.newaxis, :]
-                ) * self.dt
-                self.normalise_forward()
+        feedback_weight_update = (
+            self.dt
+            * self.learn_rate
+            * self.conjunctive_neurons[..., np.newaxis]
+            * self.visual_trace[np.newaxis, np.newaxis, ...]
+        )
+
+        gate = np.tanh(np.sum(self.visual_trace)) if self.vision_gated else 1.0
+        bs = self.backward_strength * gate
+
+        yw_anchor_input = bs * np.einsum(
+            "ijk,ij->k", self._yaw_conj_w, self.conjunctive_neurons
+        )
+        pi_anchor_input = bs * np.einsum(
+            "ijk,ij->k", self._pitch_conj_w, self.conjunctive_neurons
+        )
+        if self.shunting_inhibition:
+            drive = np.maximum(forward_input + visual_input, 0.0) * self.conj_gain
+            input = drive / (self.sigma_div + self.div_strength * np.sum(drive))
+        else:
+            input = np.maximum(forward_input + visual_input - self.inhibition, 0.0) * self.conj_gain
+
 
         self.conjunctive_neurons = (
             self.conjunctive_neurons
-            + (self.dt / self.tau)
-            * (np.maximum(total_input, 0.0) - self.conjunctive_neurons)
+            + (self.dt / self.tau_conj)
+            * (input - self.conjunctive_neurons)
             + conj_noise_term
         )
 
@@ -528,6 +527,8 @@ class BatHeadDirectionSystem:
             + (self.dt / self.tau_visual) * (raw_visual - self.visual_trace)
             + visual_noise_term
         )
+        self._feedback_w += feedback_weight_update
+        self.normalize_feedback_weight()
 
         self.yaw_ring.step(v[0], anchor_input=yw_anchor_input)
         self.pitch_ring.step(v[1], anchor_input=pi_anchor_input)
@@ -592,7 +593,7 @@ class BatHeadDirectionSystem:
         output_dict["conj_angles"] = self.conjunctive_angels.copy()
 
         output_dict["conj_cells"] = np.zeros(
-            (record_steps, self.n_conjunctive_total), dtype=float
+            (record_steps, self.n_conj_yaw, self.n_conj_pitch), dtype=float
         )
         output_dict["yaw_cells"] = np.zeros((record_steps, self.n_yaw), dtype=float)
         output_dict["pitch_cells"] = np.zeros((record_steps, self.n_pitch), dtype=float)
@@ -601,18 +602,7 @@ class BatHeadDirectionSystem:
         )
         output_dict["decoded_angle"] = np.zeros((record_steps, 2), dtype=float)
         if save_weights:
-            output_dict["yaw_anchor_weights"] = np.zeros(
-                (record_steps, *self._yaw_anchor_w.shape), dtype=float
-            )
-            output_dict["pitch_anchor_weights"] = np.zeros(
-                (record_steps, *self._pitch_anchor_w.shape), dtype=float
-            )
-            output_dict["yaw_fwd_weights"] = np.zeros(
-                (record_steps, *self._yaw_anchor_w.T.shape), dtype=float
-            )
-            output_dict["pitch_fwd_weights"] = np.zeros(
-                (record_steps, *self._pitch_anchor_w.T.shape), dtype=float
-            )
+            pass
 
         range_generator = (
             tqdm(range(n_steps), desc="Running Simulation Steps")
@@ -642,12 +632,6 @@ class BatHeadDirectionSystem:
                 ).flatten()
                 output_dict["visual_trace"][record_iter] = self.visual_trace
                 if save_weights:
-                    output_dict["yaw_anchor_weights"][record_iter] = self._yaw_anchor_w
-                    output_dict["pitch_anchor_weights"][
-                        record_iter
-                    ] = self._pitch_anchor_w
-                    yaw_fwd, pitch_fwd = self._forward_weights()
-                    output_dict["yaw_fwd_weights"][record_iter] = yaw_fwd
-                    output_dict["pitch_fwd_weights"][record_iter] = pitch_fwd
+                    pass
 
         return output_dict
