@@ -2,6 +2,7 @@ import numpy as np
 from typing import Union, Tuple, Dict
 from tqdm import tqdm
 from .plot_tools import angular_error
+from dataclasses import dataclass
 
 
 def sphere_to_toroid(yaw, pitch):
@@ -275,122 +276,147 @@ class HeadDirectionNetwork:
         return s_2d / np.sum(s_2d)
 
 
+@dataclass
+class BatHDSystemConfig:
+    n_ring: Tuple[int, int] = (256, 128)
+    n_conjunctive: Tuple[int, int] = (10, 5)
+    n_landmark: int = 10
+    tau: float = 10e-3
+    dt: float = 0.5e-3
+    intrinsic_noise: float = 0
+    input_noise: float = 0.1
+    size: float = 1 / 3
+    tau_visual: float = None
+    tau_conj: float = None
+    eps: float = 1e-6
+    ring_conj_projection_strength: Union[float, Tuple[float, float]] = 1
+    ring_input_strength: Union[float, Tuple[float, float]] = (0.4, 0.2)
+    conj_feedback_strength: float = 1
+    visual_drive: float = 1
+    conj_gain: float = 3
+    gravity_gated: bool = False
+    vision_gated: bool = False
+    feedback_mode: str = "none"
+    learn_weights: bool = True
+    learn_interval: int = 1
+    learn_rate: float = 5e-2
+    learn_gate_thr: float = 0.3
+    weight_init: str = "transpose"
+    inhibition: float = 1
+
+
 class BatHeadDirectionSystem:
     YAW_RANGE = (0, 2 * 180)
-    PITCH_RANGE = (-50, 50)
-    FEEDBACK_MODES = ("none", "direct", "conjunctive")
-    C2R_INITS = ("transpose", "random", "zero")
+    PITCH_RANGE = (-60, 60)
+    FEEDBACK_MODES = ("none", "direct", "conjunctive_grid", "visual_field")
 
     def __init__(
         self,
-        n_ring=(256, 128),
-        n_conjunctive=(10, 5),
-        n_landmark=10,
-        tau=10e-3,
-        dt=0.5e-3,
-        intrinsic_noise=0,
-        input_noise=0.1,
-        size=1 / 3,
-        tau_visual=None,
-        eps=1e-8,
-        ring_conj_projection_strength=1,
-        ring_input_strength=(0.4,0.2),
-        conj_feedback_strength=1,
-        visual_drive=1,
-        conj_gain=2,
-        gravity_gated=False,
-        vision_gated=False,
-        feedback_mode: str = "conjunctive",
-        learn_weights: bool = True,
-        learn_interval: int = 1,
-        direct_learn_rate: float = 5e-2,
-        direct_learn_gate_thr=0.3,
-        c2r_init: str = "transpose",
-        c2r_learn_rate: float = 0,
-        inhibition: float = 1.0,
-        rng: np.random.Generator = None,
-        **kwargs,
+        config: BatHDSystemConfig = BatHDSystemConfig(),
+        seed: int = 42,
     ):
-        if feedback_mode not in self.FEEDBACK_MODES:
+        self.n_yaw = config.n_ring[0]
+        self.n_pitch = config.n_ring[1]
+        self.dt = config.dt
+        self.tau = config.tau
+        self.tau_visual = (
+            config.tau_visual if config.tau_visual is not None else 2 * config.tau
+        )
+        self.tau_conj = (
+            config.tau_conj if config.tau_conj is not None else config.tau / 3
+        )
+        self.eps = config.eps
+
+        self.gravity_gated = config.gravity_gated
+        self.vision_gated = config.vision_gated
+
+        self.rng = np.random.default_rng(seed)
+        self.intrinsic_noise = config.intrinsic_noise
+        self.input_noise = config.input_noise
+
+        self.ring_conj_projection_strength = (
+            np.asarray((config.ring_conj_projection_strength,) * 2)
+            if np.isscalar(config.ring_conj_projection_strength)
+            else np.asarray(config.ring_conj_projection_strength)
+        )
+        self.ring_input_strength = (
+            np.asarray((config.ring_input_strength,) * 2)
+            if np.isscalar(config.ring_input_strength)
+            else np.asarray(config.ring_input_strength)
+        )
+        self.visual_drive = config.visual_drive
+        self.conj_feedback_strength = config.conj_feedback_strength
+        self.conj_gain = config.conj_gain
+        self.inhibition = config.inhibition
+
+        self.feedback_mode = config.feedback_mode.lower()
+        self.learn_weights = (
+            config.learn_weights if self.feedback_mode != "none" else False
+        )
+        self.learn_rate = config.learn_rate
+        self.learn_gate_thr = config.learn_gate_thr
+        self.learn_interval = config.learn_interval
+
+        if self.feedback_mode not in self.FEEDBACK_MODES:
             raise ValueError(f"feedback_mode must be one of {self.FEEDBACK_MODES}")
-        if np.isscalar(n_conjunctive) or len(n_conjunctive) != 2:
+        if np.isscalar(config.n_conjunctive) or len(config.n_conjunctive) != 2:
             raise ValueError(
                 "n_conjunctive must be a (n_yaw_cells, n_pitch_cells) grid"
             )
 
-        self.n_conj_yaw, self.n_conj_pitch = n_conjunctive
-        self.n_landmark = n_landmark
-        self.n_yaw = n_ring[0]
-        self.n_pitch = n_ring[1]
+        self.n_conj_yaw, self.n_conj_pitch = config.n_conjunctive
+        self.n_landmark = (
+            config.n_conjunctive
+            if self.feedback_mode == "visual_field"
+            else config.n_landmark
+        )
 
-        rng = rng or np.random.default_rng(seed=0)
+        rng = np.random.default_rng(seed)
         self.yaw_ring = HeadDirectionNetwork(
             (self.n_yaw,),
-            tau,
-            dt,
-            intrinsic_noise,
-            input_noise,
-            size,
+            self.tau,
+            self.dt,
+            self.intrinsic_noise,
+            self.input_noise,
+            config.size,
             use_single_bump=True,
             rng=rng,
-            **kwargs,
         )
         self.pitch_ring = HeadDirectionNetwork(
             (self.n_pitch,),
-            tau,
-            dt,
-            intrinsic_noise,
-            input_noise,
-            size,
+            self.tau,
+            self.dt,
+            self.intrinsic_noise,
+            self.input_noise,
+            config.size,
             use_single_bump=True,
             rng=rng,
-            **{"revolutions": 1, **kwargs},
-        )
-        self.dt = dt
-        self.tau = tau
-        self.tau_visual = tau_visual if tau_visual is not None else 2 * tau
-        self.tau_conj = tau / 3
-        self.eps = eps
-        self.conj_learn_rate = 5e-2
-
-        self.gravity_gated = gravity_gated
-        self.vision_gated = vision_gated
-
-        self.rng = rng
-        self.intrinsic_noise = intrinsic_noise
-        self.input_noise = input_noise
-
-        self.ring_conj_projection_strength = np.asarray((ring_conj_projection_strength,) * 2) if np.isscalar(ring_conj_projection_strength) else np.asarray(ring_conj_projection_strength)
-        self.ring_input_strength = np.asarray((ring_input_strength,) * 2) if np.isscalar(ring_input_strength) else np.asarray(ring_input_strength)
-        self.visual_drive = visual_drive
-        self.conj_feedback_strength = conj_feedback_strength
-        self.conj_gain = conj_gain
-        self.inhibition = inhibition
-
-        self.feedback_mode = feedback_mode
-        self.learn_weights = learn_weights
-        self.direct_learn_rate = direct_learn_rate
-        self.direct_learn_gate_thr = direct_learn_gate_thr
-        self.c2r_learn_rate = c2r_learn_rate
-        self.learn_interval = learn_interval
-
-        self.landmark_angles = np.stack(
-            [
-                rng.uniform(*self.YAW_RANGE, size=n_landmark),
-                rng.uniform(*self.PITCH_RANGE, size=n_landmark),
-            ],
-            axis=-1,
         )
 
         yaw_linspace = np.linspace(0, 360, self.n_conj_yaw, endpoint=False)
-        pitch_linspace = np.linspace(-90, 90, self.n_conj_pitch, endpoint=True)
+        pitch_linspace = np.linspace(
+            *self.PITCH_RANGE, self.n_conj_pitch, endpoint=True
+        )
         self.conjunctive_angels = np.array(np.meshgrid(yaw_linspace, pitch_linspace)).T
         self.visual_field = np.array((0.1, 0.1))
-        self.connectivity_sigma = np.array([1 / self.n_yaw, 0.5 / self.n_pitch]) * 2
+        self.connectivity_sigma = (
+            np.array([1 / self.n_conj_yaw, 0.5 / self.n_conj_pitch]) * 2
+        )
 
-        self.visual_trace = rng.uniform(0, 0.1, size=n_landmark)
+        if self.feedback_mode == "visual_field":
+            self.landmark_angles = self.conjunctive_angels.copy()
+            self.landmark_cells = self.rng.uniform(0, 0.1, size=self.n_landmark)
+        else:
+            self.landmark_angles = np.stack(
+                [
+                    self.rng.uniform(*self.YAW_RANGE, size=self.n_landmark),
+                    self.rng.uniform(*self.PITCH_RANGE, size=self.n_landmark),
+                ],
+                axis=-1,
+            )
+            self.landmark_cells = self.rng.uniform(0, 0.1, size=self.n_landmark)
 
-        self.conjunctive_neurons = rng.uniform(
+        self.conj_cells = self.rng.uniform(
             0, 0.1, size=(self.n_conj_yaw, self.n_conj_pitch)
         )
 
@@ -411,51 +437,63 @@ class BatHeadDirectionSystem:
         self._yaw_conj_w = raw_yaw_conj_w.copy()
         self._pitch_conj_w = raw_pitch_conj_w.copy()
 
-        self.conj_rng = np.random.default_rng(int(rng.integers(0, 2**32 - 1)))
-
-        self._c2r_yaw = None
-        self._c2r_pitch = None
         self._direct_w_yaw = None
         self._direct_w_pitch = None
 
-        if feedback_mode == "direct":
+        self.conj_rng = np.random.default_rng(int(rng.integers(0, 2**32 - 1)))
+
+        if self.feedback_mode == "direct":
             self._init_direct_weights()
-        elif feedback_mode == "conjunctive":
-            self._init_c2r_weights(c2r_init)
+        elif self.feedback_mode == "conjunctive_grid":
+            self._init_conjunctive_grid_weights()
+        elif self.feedback_mode == "visual_field":
+            self._init_visual_field_weights(config.weight_init)
 
         self.last_feedback_norm = np.zeros(2)
         self.speed_gate_k = 1 / 50
         self.speed_gate_thr = 50
 
-    def _init_c2r_weights(self, c2r_init):
-        if c2r_init == "transpose":
-            self._c2r_yaw = self._yaw_conj_w.copy()
-            self._c2r_pitch = self._pitch_conj_w.copy()
-        elif c2r_init == "random":
-            self._c2r_yaw = self.conj_rng.uniform(size=self._yaw_conj_w.shape)
-            self._c2r_pitch = self.conj_rng.uniform(size=self._pitch_conj_w.shape)
-            self._c2r_yaw /= self._c2r_yaw.sum(axis=-1, keepdims=True)
-            self._c2r_pitch /= self._c2r_pitch.sum(axis=-1, keepdims=True)
-        else:  # "zero"
-            self._c2r_yaw = np.zeros_like(self._yaw_conj_w)
-            self._c2r_pitch = np.zeros_like(self._pitch_conj_w)
+    def _init_conjunctive_grid_weights(self):
         self._conj_feedback_w = self.conj_rng.uniform(
             size=(self.n_conj_yaw, self.n_conj_pitch, self.n_landmark)
         )
-        self._conj_feedback_w /= self._conj_feedback_w.sum(axis=-1, keepdims=True)
+        self._conj_feedback_w /= (
+            self._conj_feedback_w.sum(axis=-1, keepdims=True) + self.eps
+        )
         self._conj_feedback_w *= 0.1
 
     def _init_direct_weights(self):
-        self._direct_w_yaw = self.conj_rng.uniform(
-            size=(self.n_landmark, self.n_yaw)
-        )
+        self._direct_w_yaw = self.conj_rng.uniform(size=(self.n_landmark, self.n_yaw))
         self._direct_w_pitch = self.conj_rng.uniform(
             size=(self.n_landmark, self.n_pitch)
         )
-        self._direct_w_yaw /= np.sum(self._direct_w_yaw, axis=1, keepdims=True)
-        self._direct_w_pitch /= np.sum(self._direct_w_pitch, axis=1, keepdims=True)
+        self._direct_w_yaw /= (
+            np.sum(self._direct_w_yaw, axis=1, keepdims=True) + self.eps
+        )
+        self._direct_w_pitch /= (
+            np.sum(self._direct_w_pitch, axis=1, keepdims=True) + self.eps
+        )
         self._direct_w_yaw *= 0.1
         self._direct_w_pitch *= 0.1
+
+    def _init_visual_field_weights(self, weight_init):
+        if weight_init == "transpose":
+            self._yaw_conj_w = self._yaw_conj_w.copy()
+            self._pitch_conj_w = self._pitch_conj_w.copy()
+        elif weight_init == "random":
+            self._yaw_conj_w = self.rng.uniform(size=self._yaw_conj_w.shape)
+            self._pitch_conj_w = self.rng.uniform(size=self._pitch_conj_w.shape)
+            self._yaw_conj_w /= (
+                np.sum(self._yaw_conj_w, axis=-1, keepdims=True) + self.eps
+            )
+            self._pitch_conj_w /= (
+                np.sum(self._pitch_conj_w, axis=-1, keepdims=True) + self.eps
+            )
+            self._yaw_conj_w *= 0.1
+            self._pitch_conj_w *= 0.1
+        else:  # "zero"
+            self._yaw_conj_w = np.zeros_like(self._yaw_conj_w)
+            self._pitch_conj_w = np.zeros_like(self._pitch_conj_w)
 
     def set_noise(self, intrinsic_noise=None, input_noise=None):
         """Set the per-step noise scales."""
@@ -473,28 +511,44 @@ class BatHeadDirectionSystem:
         d2 = err**2
         return np.exp(np.sum(-d2 / (2 * self.visual_field**2), axis=-1))
 
-    def _ring_feedback(self, innovation):
-        """Return (yaw_input, pitch_input) for the rings, or (None, None)."""
+    def _ring_feedback(self):
+
         if self.feedback_mode == "none":
             return None, None
+
         elif self.feedback_mode == "direct":
-            yaw_fb = self.ring_input_strength[0] * (self.visual_trace @ self._direct_w_yaw)
-            pitch_fb = self.ring_input_strength[1] * (
-                self.visual_trace @ self._direct_w_pitch
+            yaw_fb = self.ring_input_strength[0] * np.einsum(
+                "ik,i->k", self._direct_w_yaw, self.landmark_cells
+            )
+            pitch_fb = self.ring_input_strength[1] * np.einsum(
+                "ik,i->k", self._direct_w_pitch, self.landmark_cells
             )
             return yaw_fb, pitch_fb
-        elif self.feedback_mode == "conjunctive":
-            gate = np.tanh(np.sum(self.visual_trace)) if self.vision_gated else 1.0
+
+        elif self.feedback_mode == "conjunctive_grid":
+            gate = np.tanh(np.sum(self.landmark_cells)) if self.vision_gated else 1.0
             bs = self.ring_input_strength * gate
-            yaw_fb = bs[0] * np.einsum("ijk,ij->k", self._c2r_yaw, innovation)
-            pitch_fb = bs[1] * np.einsum("ijk,ij->k", self._c2r_pitch, innovation)
+            yaw_fb = bs[0] * np.einsum("ijk,ij->k", self._yaw_conj_w, self.conj_cells)
+            pitch_fb = bs[1] * np.einsum(
+                "ijk,ij->k", self._pitch_conj_w, self.conj_cells
+            )
             return yaw_fb, pitch_fb
+
+        elif self.feedback_mode == "visual_field":
+            gate = np.tanh(np.sum(self.landmark_cells)) if self.vision_gated else 1.0
+            bs = self.ring_input_strength * gate
+            yaw_fb = bs[0] * np.einsum("ijk,ij->k", self._yaw_conj_w, self.conj_cells)
+            pitch_fb = bs[1] * np.einsum(
+                "ijk,ij->k", self._pitch_conj_w, self.conj_cells
+            )
+            return yaw_fb, pitch_fb
+
         else:
             raise ValueError(f"Unknown feedback mode: {self.feedback_mode}")
 
     def _learn_direct(self):
-        learning_trace = self.visual_trace * (
-            self.visual_trace > self.direct_learn_gate_thr
+        learning_trace = self.landmark_cells * (
+            self.landmark_cells > self.learn_gate_thr
         )
         for w, ring in (
             (self._direct_w_yaw, self.yaw_ring),
@@ -502,54 +556,57 @@ class BatHeadDirectionSystem:
         ):
             ring_weight_update = (
                 self.dt
-                * self.direct_learn_rate
+                * self.learn_rate
                 * self.learn_interval
                 * learning_trace[..., np.newaxis]
                 * ring.s[np.newaxis, ...]
             )
             w += ring_weight_update
             w /= np.clip(
-                np.sum(w, axis=tuple(range(1, w.ndim)), keepdims=True),
-                self.eps,
-                None,
-            )
-
-    def _learn_conj(self):
-        for w, ring in (
-            (self._c2r_yaw, self.yaw_ring),
-            (self._c2r_pitch, self.pitch_ring),
-        ):
-            ring_weight_update = (
-                self.dt
-                * self.c2r_learn_rate
-                * self.learn_interval
-                * self.conjunctive_neurons[..., np.newaxis]
-                * ring.s[np.newaxis, np.newaxis, ...]
-            )
-            w += ring_weight_update
-            w /= np.clip(
-                np.sum(w, axis=tuple(range(1, w.ndim)), keepdims=True),
+                np.sum(w, axis=-1, keepdims=True),
                 1,
                 None,
             )
 
+    def _learn_conjunctive_grid(self):
+        conj_learning_trace = self.landmark_cells * (
+            self.landmark_cells > self.learn_gate_thr
+        )
         conj_feedback_weight_update = (
             self.dt
             * self.learn_interval
-            * self.conj_learn_rate
-            * self.conjunctive_neurons[..., np.newaxis]
-            * self.visual_trace[np.newaxis, np.newaxis, ...]
+            * self.learn_rate
+            * self.conj_cells[..., np.newaxis]
+            * conj_learning_trace[np.newaxis, np.newaxis, ...]
         )
         self._conj_feedback_w += conj_feedback_weight_update
         self._conj_feedback_w /= np.clip(
-            np.sum(
-                self._conj_feedback_w,
-                axis=tuple(range(self._conj_feedback_w.ndim - 1)),
-                keepdims=True,
-            ),
+            np.sum(self._conj_feedback_w, axis=(1, 2), keepdims=True),
             1,
             None,
         )
+
+    def _learn_visual_field(self):
+        conjunctive_learning_trace = self.conj_cells * (
+            self.conj_cells > self.learn_gate_thr
+        )
+        for w, ring in (
+            (self._yaw_conj_w, self.yaw_ring),
+            (self._pitch_conj_w, self.pitch_ring),
+        ):
+            ring_weight_update = (
+                self.dt
+                * self.learn_rate
+                * self.learn_interval
+                * conjunctive_learning_trace[..., np.newaxis]
+                * ring.s[np.newaxis, np.newaxis, ...]
+            )
+            w += ring_weight_update
+            w /= np.clip(
+                np.sum(w, axis=-1, keepdims=True),
+                1,
+                None,
+            )
 
     def step(
         self,
@@ -565,7 +622,7 @@ class BatHeadDirectionSystem:
                 dir[np.newaxis, :],
             )
         else:
-            raw_visual = np.zeros_like(self.visual_trace)
+            raw_visual = np.zeros_like(self.landmark_cells)
 
         if self.gravity_gated and inverted is not None:
             upright = 1.0 - float(bool(inverted))
@@ -583,26 +640,35 @@ class BatHeadDirectionSystem:
         if self.intrinsic_noise:
             noise_amp = self.intrinsic_noise * np.sqrt(self.dt / self.tau_conj)
             conj_noise_term = noise_amp * self.conj_rng.normal(
-                size=self.conjunctive_neurons.shape
+                size=self.conj_cells.shape
             )
 
         yaw_overlap = np.dot(self._yaw_conj_w, self.yaw_ring.s)
         pitch_overlap = np.dot(self._pitch_conj_w, self.pitch_ring.s)
-        forward_input = self.ring_conj_projection_strength[0] * yaw_overlap + self.ring_conj_projection_strength[1] *pitch_overlap
-
-        if self.feedback_mode == "conjunctive":
-            visual_input = self.conj_feedback_strength * np.dot(
-                self._conj_feedback_w, self.visual_trace
-            )
-            innovation_input = forward_input + visual_input
-        else:
-            innovation_input = forward_input
-
-        innovation = (
-            np.maximum(innovation_input - self.inhibition, 0.0) * self.conj_gain
+        forward_input = (
+            self.ring_conj_projection_strength[0] * yaw_overlap
+            + self.ring_conj_projection_strength[1] * pitch_overlap
         )
 
-        yaw_fb, pitch_fb = self._ring_feedback(innovation)
+        if self.feedback_mode == "conjunctive_grid":
+            visual_input = self.conj_feedback_strength * np.dot(
+                self._conj_feedback_w, self.landmark_cells
+            )
+            conj_input = forward_input + visual_input
+        elif self.feedback_mode == "visual_field":
+            conj_input = (
+                forward_input + self.conj_feedback_strength * self.landmark_cells
+            )
+        elif self.feedback_mode == "direct":
+            conj_input = forward_input
+        elif self.feedback_mode == "none":
+            conj_input = forward_input
+        else:
+            raise ValueError(f"Unknown feedback mode: {self.feedback_mode}")
+
+        conj_input = np.maximum(conj_input - self.inhibition, 0.0) * self.conj_gain
+
+        yaw_fb, pitch_fb = self._ring_feedback()
         self.last_feedback_norm = np.array(
             [
                 0.0 if yaw_fb is None else np.linalg.norm(yaw_fb),
@@ -610,22 +676,21 @@ class BatHeadDirectionSystem:
             ]
         )
 
-        if self.learn_weights and iteration % self.learn_interval == 0:
-            if self.feedback_mode == "direct":
-                self._learn_direct()
-            elif self.feedback_mode == "conjunctive":
-                self._learn_conj()
-            else:
-                pass
+        if (
+            self.learn_weights
+            and iteration % self.learn_interval == 0
+            and self.feedback_mode != "none"
+        ):
+            getattr(self, f"_learn_{self.feedback_mode.replace('-', '_')}")()
 
-        self.conjunctive_neurons = (
-            self.conjunctive_neurons
-            + (self.dt / self.tau_conj) * (innovation - self.conjunctive_neurons)
+        self.conj_cells = (
+            self.conj_cells
+            + (self.dt / self.tau_conj) * (conj_input - self.conj_cells)
             + conj_noise_term
         )
 
-        self.visual_trace = self.visual_trace + (self.dt / self.tau_visual) * (
-            raw_visual - self.visual_trace
+        self.landmark_cells = self.landmark_cells + (self.dt / self.tau_visual) * (
+            raw_visual - self.landmark_cells
         )
 
         self.yaw_ring.step(v[0], anchor_input=yaw_fb)
@@ -696,8 +761,8 @@ class BatHeadDirectionSystem:
         )
         output_dict["yaw_cells"] = np.zeros((record_steps, self.n_yaw), dtype=float)
         output_dict["pitch_cells"] = np.zeros((record_steps, self.n_pitch), dtype=float)
-        output_dict["visual_trace"] = np.zeros(
-            (record_steps, *self.visual_trace.shape), dtype=float
+        output_dict["landmark_cells"] = np.zeros(
+            (record_steps, *self.landmark_cells.shape), dtype=float
         )
         output_dict["decoded_angle"] = np.zeros((record_steps, 2), dtype=float)
         output_dict["feedback_norm"] = np.zeros((record_steps, 2), dtype=float)
@@ -709,15 +774,16 @@ class BatHeadDirectionSystem:
                 output_dict["direct_pitch_w"] = np.zeros(
                     (record_steps, *self._direct_w_pitch.shape), dtype=float
                 )
-            elif self.feedback_mode == "conjunctive":
-                output_dict["c2r_yaw_w"] = np.zeros(
-                    (record_steps, *self._c2r_yaw.shape), dtype=float
-                )
-                output_dict["c2r_pitch_w"] = np.zeros(
-                    (record_steps, *self._c2r_pitch.shape), dtype=float
-                )
+            elif self.feedback_mode == "conjunctive_grid":
                 output_dict["conj_feedback_w"] = np.zeros(
                     (record_steps, *self._conj_feedback_w.shape), dtype=float
+                )
+            elif self.feedback_mode == "visual_field":
+                output_dict["yaw_conj_w"] = np.zeros(
+                    (record_steps, *self._yaw_conj_w.shape), dtype=float
+                )
+                output_dict["pitch_conj_w"] = np.zeros(
+                    (record_steps, *self._pitch_conj_w.shape), dtype=float
                 )
 
         range_generator = (
@@ -737,7 +803,7 @@ class BatHeadDirectionSystem:
 
             if step_iter % interval == 0:
                 record_iter = step_iter // interval
-                output_dict["conj_cells"][record_iter] = self.conjunctive_neurons.copy()
+                output_dict["conj_cells"][record_iter] = self.conj_cells.copy()
                 output_dict["yaw_cells"][record_iter] = self.yaw_ring.s.copy()
                 output_dict["pitch_cells"][record_iter] = self.pitch_ring.s.copy()
                 output_dict["decoded_angle"][record_iter] = np.stack(
@@ -746,7 +812,7 @@ class BatHeadDirectionSystem:
                         self.pitch_ring.decode_orientation(),
                     ]
                 ).flatten()
-                output_dict["visual_trace"][record_iter] = self.visual_trace
+                output_dict["landmark_cells"][record_iter] = self.landmark_cells
                 output_dict["feedback_norm"][record_iter] = self.last_feedback_norm
 
                 if save_weights:
@@ -757,12 +823,14 @@ class BatHeadDirectionSystem:
                         output_dict["direct_pitch_w"][
                             record_iter
                         ] = self._direct_w_pitch.copy()
-                    elif self.feedback_mode == "conjunctive":
-                        output_dict["c2r_yaw_w"][record_iter] = self._c2r_yaw.copy()
-                        output_dict["c2r_pitch_w"][record_iter] = self._c2r_pitch.copy()
+                    elif self.feedback_mode == "conjunctive_grid":
                         output_dict["conj_feedback_w"][
                             record_iter
                         ] = self._conj_feedback_w.copy()
+                    elif self.feedback_mode == "visual_field":
+                        output_dict["yaw_conj_w"][record_iter] = self._yaw_conj_w.copy()
+                        output_dict["pitch_conj_w"][
+                            record_iter
+                        ] = self._pitch_conj_w.copy()
 
         return output_dict
-
