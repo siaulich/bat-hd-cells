@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 requires-python = ">= 3.0"
 
 [project]
-name = "grid-cells"
+name = "hd-hd"
 authors = [{name = "Siemen Aulich"}]
 version = "0.1.0"
 description = "Implementation of simple grid cell models"

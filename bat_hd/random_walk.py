@@ -380,3 +380,14 @@ def generate_bat_flight(
         "dir_vel": heading_velocity,
         "time": time,
     }
+
+
+def split_flight_data(high_noise_bat_flight, split_time):
+    split_index = np.searchsorted(high_noise_bat_flight["time"], split_time)
+    bat_flight_1 = {
+        key: value[:split_index] for key, value in high_noise_bat_flight.items()
+    }
+    bat_flight_2 = {
+        key: value[split_index:] for key, value in high_noise_bat_flight.items()
+    }
+    return bat_flight_1, bat_flight_2

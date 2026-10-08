@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Union, Tuple, Dict
+from typing import Union, Tuple, Dict,Optional
 from tqdm import tqdm
 from .plot_tools import angular_error
 from dataclasses import dataclass
@@ -24,7 +24,6 @@ class HeadDirectionNetwork:
         rng: np.random.Generator = None,
         **kwargs,
     ):
-
         self.shape = (int(n),) if np.isscalar(n) else tuple(map(int, n))
         if not self.shape or any(size < 1 for size in self.shape):
             raise ValueError("n must be a positive integer or a sequence of integers")
@@ -43,8 +42,8 @@ class HeadDirectionNetwork:
             raise ValueError("WTF?")
 
         if not use_single_bump:
-            beta = 0.01 * size
-            gamma = 1.05 * beta
+            beta = 0.01 * size * 256 / n
+            gamma = 1.05 * beta  * 256 / n
             a_weight = 1
             self.kernel_func = lambda dx: a_weight * np.exp(
                 -np.dot(dx, gamma)
@@ -94,12 +93,12 @@ class HeadDirectionNetwork:
         if np.isscalar(v):
             v_array = np.ones((self.ndim)) * v
         else:
-            v_array = np.asarray(v)
+            v_array = np.array(v)
 
         if eff_input_noise:
             v_array += (
                 eff_input_noise
-                * np.sqrt(self.dt / self.tau)
+                * np.sqrt(self.tau/self.dt)
                 * self.rng.normal(size=v_array.shape)
                 * np.abs(v_array)
             )
@@ -210,13 +209,6 @@ class HeadDirectionNetwork:
     def _feedforward_input(self, s, v):
         return self.B0
 
-    def _add_variables(self, output_dict, n_steps):
-        output_dict["decoded_angle"] = np.zeros((n_steps, 2))
-        output_dict["anchor_input"] = np.zeros(n_steps)
-
-    def _record_variables(self, output_dict, step_iter):
-        output_dict["decoded_angle"][step_iter] = self.decode_orientation()
-
     def decode_orientation(self, s=None):
         """Decode the activity bump position into one angle per axis.
 
@@ -279,7 +271,7 @@ class HeadDirectionNetwork:
 @dataclass
 class BatHDSystemConfig:
     n_ring: Tuple[int, int] = (256, 128)
-    n_conjunctive: Tuple[int, int] = (10, 5)
+    n_conjunctive: Tuple[int, int] = (20, 10)
     n_landmark: int = 10
     tau: float = 10e-3
     dt: float = 0.5e-3
@@ -299,16 +291,16 @@ class BatHDSystemConfig:
     feedback_mode: str = "none"
     learn_weights: bool = True
     learn_interval: int = 1
-    learn_rate: float = 5e-2
+    learn_rate: float = 1
     learn_gate_thr: float = 0.3
-    weight_init: str = "transpose"
+    weight_init: str = "random"
     inhibition: float = 1
 
 
 class BatHeadDirectionSystem:
     YAW_RANGE = (0, 2 * 180)
     PITCH_RANGE = (-60, 60)
-    FEEDBACK_MODES = ("none", "direct", "conjunctive_grid", "visual_field")
+    FEEDBACK_MODES = ("none", "direct", "conjunctive_grid")
 
     def __init__(
         self,
@@ -320,7 +312,7 @@ class BatHeadDirectionSystem:
         self.dt = config.dt
         self.tau = config.tau
         self.tau_visual = (
-            config.tau_visual if config.tau_visual is not None else 2 * config.tau
+            config.tau_visual if config.tau_visual is not None else 3 * config.tau
         )
         self.tau_conj = (
             config.tau_conj if config.tau_conj is not None else config.tau / 3
@@ -365,11 +357,7 @@ class BatHeadDirectionSystem:
             )
 
         self.n_conj_yaw, self.n_conj_pitch = config.n_conjunctive
-        self.n_landmark = (
-            config.n_conjunctive
-            if self.feedback_mode == "visual_field"
-            else config.n_landmark
-        )
+        self.n_landmark = config.n_landmark
 
         rng = np.random.default_rng(seed)
         self.yaw_ring = HeadDirectionNetwork(
@@ -398,23 +386,19 @@ class BatHeadDirectionSystem:
             *self.PITCH_RANGE, self.n_conj_pitch, endpoint=True
         )
         self.conjunctive_angels = np.array(np.meshgrid(yaw_linspace, pitch_linspace)).T
-        self.visual_field = np.array((0.1, 0.1))
+        self.visual_field = np.array((0.2, 0.1))
         self.connectivity_sigma = (
             np.array([1 / self.n_conj_yaw, 0.5 / self.n_conj_pitch]) * 2
         )
 
-        if self.feedback_mode == "visual_field":
-            self.landmark_angles = self.conjunctive_angels.copy()
-            self.landmark_cells = self.rng.uniform(0, 0.1, size=self.n_landmark)
-        else:
-            self.landmark_angles = np.stack(
-                [
-                    self.rng.uniform(*self.YAW_RANGE, size=self.n_landmark),
-                    self.rng.uniform(*self.PITCH_RANGE, size=self.n_landmark),
-                ],
-                axis=-1,
-            )
-            self.landmark_cells = self.rng.uniform(0, 0.1, size=self.n_landmark)
+        self.landmark_angles = np.stack(
+            [
+                self.rng.uniform(*self.YAW_RANGE, size=self.n_landmark),
+                self.rng.uniform(*self.PITCH_RANGE, size=self.n_landmark),
+            ],
+            axis=-1,
+        )
+        self.landmark_cells = self.rng.uniform(0, 0.1, size=self.n_landmark)
 
         self.conj_cells = self.rng.uniform(
             0, 0.1, size=(self.n_conj_yaw, self.n_conj_pitch)
@@ -446,8 +430,6 @@ class BatHeadDirectionSystem:
             self._init_direct_weights()
         elif self.feedback_mode == "conjunctive_grid":
             self._init_conjunctive_grid_weights()
-        elif self.feedback_mode == "visual_field":
-            self._init_visual_field_weights(config.weight_init)
 
         self.last_feedback_norm = np.zeros(2)
         self.speed_gate_k = 1 / 50
@@ -458,7 +440,7 @@ class BatHeadDirectionSystem:
             size=(self.n_conj_yaw, self.n_conj_pitch, self.n_landmark)
         )
         self._conj_feedback_w /= (
-            self._conj_feedback_w.sum(axis=-1, keepdims=True) + self.eps
+            self._conj_feedback_w.sum(axis=(0,1), keepdims=True) + self.eps
         )
         self._conj_feedback_w *= 0.1
 
@@ -475,25 +457,6 @@ class BatHeadDirectionSystem:
         )
         self._direct_w_yaw *= 0.1
         self._direct_w_pitch *= 0.1
-
-    def _init_visual_field_weights(self, weight_init):
-        if weight_init == "transpose":
-            self._yaw_conj_w = self._yaw_conj_w.copy()
-            self._pitch_conj_w = self._pitch_conj_w.copy()
-        elif weight_init == "random":
-            self._yaw_conj_w = self.rng.uniform(size=self._yaw_conj_w.shape)
-            self._pitch_conj_w = self.rng.uniform(size=self._pitch_conj_w.shape)
-            self._yaw_conj_w /= (
-                np.sum(self._yaw_conj_w, axis=-1, keepdims=True) + self.eps
-            )
-            self._pitch_conj_w /= (
-                np.sum(self._pitch_conj_w, axis=-1, keepdims=True) + self.eps
-            )
-            self._yaw_conj_w *= 0.1
-            self._pitch_conj_w *= 0.1
-        else:  # "zero"
-            self._yaw_conj_w = np.zeros_like(self._yaw_conj_w)
-            self._pitch_conj_w = np.zeros_like(self._pitch_conj_w)
 
     def set_noise(self, intrinsic_noise=None, input_noise=None):
         """Set the per-step noise scales."""
@@ -533,16 +496,6 @@ class BatHeadDirectionSystem:
                 "ijk,ij->k", self._pitch_conj_w, self.conj_cells
             )
             return yaw_fb, pitch_fb
-
-        elif self.feedback_mode == "visual_field":
-            gate = np.tanh(np.sum(self.landmark_cells)) if self.vision_gated else 1.0
-            bs = self.ring_input_strength * gate
-            yaw_fb = bs[0] * np.einsum("ijk,ij->k", self._yaw_conj_w, self.conj_cells)
-            pitch_fb = bs[1] * np.einsum(
-                "ijk,ij->k", self._pitch_conj_w, self.conj_cells
-            )
-            return yaw_fb, pitch_fb
-
         else:
             raise ValueError(f"Unknown feedback mode: {self.feedback_mode}")
 
@@ -581,32 +534,11 @@ class BatHeadDirectionSystem:
         )
         self._conj_feedback_w += conj_feedback_weight_update
         self._conj_feedback_w /= np.clip(
-            np.sum(self._conj_feedback_w, axis=(1, 2), keepdims=True),
+            np.sum(self._conj_feedback_w, axis=(0,1), keepdims=True),
             1,
             None,
         )
 
-    def _learn_visual_field(self):
-        conjunctive_learning_trace = self.conj_cells * (
-            self.conj_cells > self.learn_gate_thr
-        )
-        for w, ring in (
-            (self._yaw_conj_w, self.yaw_ring),
-            (self._pitch_conj_w, self.pitch_ring),
-        ):
-            ring_weight_update = (
-                self.dt
-                * self.learn_rate
-                * self.learn_interval
-                * conjunctive_learning_trace[..., np.newaxis]
-                * ring.s[np.newaxis, np.newaxis, ...]
-            )
-            w += ring_weight_update
-            w /= np.clip(
-                np.sum(w, axis=-1, keepdims=True),
-                1,
-                None,
-            )
 
     def step(
         self,
@@ -655,10 +587,6 @@ class BatHeadDirectionSystem:
                 self._conj_feedback_w, self.landmark_cells
             )
             conj_input = forward_input + visual_input
-        elif self.feedback_mode == "visual_field":
-            conj_input = (
-                forward_input + self.conj_feedback_strength * self.landmark_cells
-            )
         elif self.feedback_mode == "direct":
             conj_input = forward_input
         elif self.feedback_mode == "none":
@@ -732,13 +660,15 @@ class BatHeadDirectionSystem:
 
     def run_simulation(
         self,
-        v: np.ndarray,
-        dir: np.ndarray = None,
-        inverted: np.ndarray = None,
+        bat_flight_data: Dict[str, np.ndarray],
         save_weights=False,
         interval=1,
         verbose=True,
     ) -> Dict[str, np.ndarray]:
+
+        v = bat_flight_data["dir_vel"]
+        dir = bat_flight_data.get("dir_sphere", None)
+        inverted = bat_flight_data.get("inverted", None)
 
         if v.ndim != 2 or v.shape[1] != 2:
             raise ValueError("Velocity input must match dimension of attractor network")
@@ -777,13 +707,6 @@ class BatHeadDirectionSystem:
             elif self.feedback_mode == "conjunctive_grid":
                 output_dict["conj_feedback_w"] = np.zeros(
                     (record_steps, *self._conj_feedback_w.shape), dtype=float
-                )
-            elif self.feedback_mode == "visual_field":
-                output_dict["yaw_conj_w"] = np.zeros(
-                    (record_steps, *self._yaw_conj_w.shape), dtype=float
-                )
-                output_dict["pitch_conj_w"] = np.zeros(
-                    (record_steps, *self._pitch_conj_w.shape), dtype=float
                 )
 
         range_generator = (
@@ -827,10 +750,5 @@ class BatHeadDirectionSystem:
                         output_dict["conj_feedback_w"][
                             record_iter
                         ] = self._conj_feedback_w.copy()
-                    elif self.feedback_mode == "visual_field":
-                        output_dict["yaw_conj_w"][record_iter] = self._yaw_conj_w.copy()
-                        output_dict["pitch_conj_w"][
-                            record_iter
-                        ] = self._pitch_conj_w.copy()
 
         return output_dict
