@@ -146,6 +146,7 @@ def generate_bat_flight(
     initial_position=None,
     initial_speed=None,
     initial_heading=None,
+    verbose: bool = True,
 ) -> Dict[str, np.ndarray]:
     """
     Generate a bat flight trajectory in a 3D box with realistic dynamics.
@@ -287,7 +288,9 @@ def generate_bat_flight(
 
     max_angular_vel = 2000  # rad/s
 
-    for step in tqdm.tqdm(range(1, n_steps)):
+    generate_progress_bar = tqdm.tqdm if verbose else lambda x, **kwargs: x
+
+    for step in generate_progress_bar(range(1, n_steps), desc="Generating bat flight"):
         h_x = np.cos(np.deg2rad(current_pitch)) * np.cos(np.deg2rad(current_azimuth))
         h_y = np.cos(np.deg2rad(current_pitch)) * np.sin(np.deg2rad(current_azimuth))
         h_z = np.sin(np.deg2rad(current_pitch))

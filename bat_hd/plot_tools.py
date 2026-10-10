@@ -88,13 +88,10 @@ def wrap_to_pi(angle):
 
 
 def angular_error(decoded, true):
-    return (
-        np.rad2deg(
-            np.arctan2(
-                np.sin(np.deg2rad(decoded - true)), np.cos(np.deg2rad(decoded - true))
-            )
+    return np.rad2deg(
+        np.arctan2(
+            np.sin(np.deg2rad(decoded - true)), np.cos(np.deg2rad(decoded - true))
         )
-        / 180
     )
 
 

@@ -1,8 +1,18 @@
 import numpy as np
-from typing import Union, Tuple, Dict,Optional
+from typing import Union, Tuple, Dict, Optional
 from tqdm import tqdm
-from .plot_tools import angular_error
 from dataclasses import dataclass
+
+
+def relative_angular_error(decoded, true):
+    return (
+        np.rad2deg(
+            np.arctan2(
+                np.sin(np.deg2rad(decoded - true)), np.cos(np.deg2rad(decoded - true))
+            )
+        )
+        / 180
+    )
 
 
 def sphere_to_toroid(yaw, pitch):
@@ -20,8 +30,8 @@ class HeadDirectionNetwork:
         intrinsic_noise=0,
         input_noise=0,
         size=1,
-        use_single_bump=False,
-        rng: np.random.Generator = None,
+        use_single_bump=True,
+        seed: int = 42,
         **kwargs,
     ):
         self.shape = (int(n),) if np.isscalar(n) else tuple(map(int, n))
@@ -30,7 +40,7 @@ class HeadDirectionNetwork:
         self.ndim = len(self.shape)
         self.tau = tau
         self.dt = dt
-        self.rng = rng or np.random.default_rng(42)
+        self.rng = np.random.default_rng(seed)
         self.intrinsic_noise = intrinsic_noise
         self.input_noise = input_noise
 
@@ -43,7 +53,7 @@ class HeadDirectionNetwork:
 
         if not use_single_bump:
             beta = 0.01 * size * 256 / n
-            gamma = 1.05 * beta  * 256 / n
+            gamma = 1.05 * beta * 256 / n
             a_weight = 1
             self.kernel_func = lambda dx: a_weight * np.exp(
                 -np.dot(dx, gamma)
@@ -98,7 +108,7 @@ class HeadDirectionNetwork:
         if eff_input_noise:
             v_array += (
                 eff_input_noise
-                * np.sqrt(self.tau/self.dt)
+                * np.sqrt(self.tau / self.dt)
                 * self.rng.normal(size=v_array.shape)
                 * np.abs(v_array)
             )
@@ -118,8 +128,11 @@ class HeadDirectionNetwork:
 
         self.s = self.s + (self.dt / self.tau) * rate_derivatives + intrinsic_noise_term
 
-    def warm_up(self, tol=1e-5, max_iter=100000):
+    def warm_up(self, tol=1e-5, max_iter=100000, initial_dir: np.ndarray = None):
         """Relax the network until consecutive states differ by less than ``tol``."""
+        if initial_dir is not None:
+            init_state = self.encode_orientation(initial_dir)
+            self.s = init_state / np.max(init_state)
         prev_net_state = self.s.copy()
         self.step(intrinsic_noise=0, input_noise=0)
         step = 0
@@ -129,7 +142,54 @@ class HeadDirectionNetwork:
             if step >= max_iter:
                 raise RuntimeError("Exceed the prescribed recursion depth")
             step += 1
-        print(f"Ran warm up for {step} steps")
+
+    def run_simulation(
+        self,
+        bat_flight_data: Dict[str, np.ndarray],
+        interval=1,
+        verbose=True,
+    ) -> Dict[str, np.ndarray]:
+
+        v = bat_flight_data["dir_vel"]
+        dir = bat_flight_data.get("dir_sphere", None)
+        inverted = bat_flight_data.get("inverted", None)
+
+        if v.ndim != 2 or v.shape[1] != 2:
+            raise ValueError("Velocity input must match dimension of attractor network")
+
+        if dir is not None:
+            if dir.ndim != 2 or dir.shape[1] != 2:
+                raise ValueError(
+                    "Velocity input must match dimension of attractor network"
+                )
+
+        n_steps = v.shape[0]
+        record_steps = (n_steps + interval - 1) // interval
+
+        output_dict = {}
+        output_dict["decoded_angle"] = np.zeros((record_steps, 2), dtype=float)
+        output_dict["interval"] = interval
+
+        range_generator = (
+            tqdm(range(n_steps), desc="Running Simulation Steps")
+            if verbose
+            else range(n_steps)
+        )
+
+        for step_iter in range_generator:
+            kwargs = {}
+            if dir is not None:
+                kwargs["dir"] = dir[step_iter]
+            if inverted is not None:
+                kwargs["inverted"] = inverted[step_iter]
+
+            self.step(v[step_iter])
+
+            if step_iter % interval == 0:
+                record_iter = step_iter // interval
+                output_dict["decoded_angle"][record_iter] = self.decode_orientation()
+
+        return output_dict
 
     def _setup_attractor(self, revolutions: Union[Tuple, float] = 1):
         self.speed_modulation = self._compute_speed_modulation(revolutions)
@@ -213,7 +273,7 @@ class HeadDirectionNetwork:
         """Decode the activity bump position into one angle per axis.
 
         Returns:
-        - np.array([angle_x, angle_y]): Estimated angles in radians [0, 2*pi).
+        - np.array([angle_x, angle_y]): Estimated angles in degrees [0, 360).
         """
         s = self.s if s is None else s
         shape = s.shape
@@ -239,7 +299,7 @@ class HeadDirectionNetwork:
         """Generate a periodic Gaussian bump for target orientation angles.
 
         Parameters:
-        - target_angles: np.array or list of [angle_x, angle_y] in radians.
+        - target_angles: np.array or list of [angle_x, angle_y] in degrees.
         - width: Controls the spatial width (spread) of the activity bump.
 
         Returns:
@@ -263,7 +323,7 @@ class HeadDirectionNetwork:
         )
         width = width * 2 * 180
 
-        s_2d = np.exp(-(np.sum(dx**2, axis=-1)) / (2 * width**2))
+        s_2d = np.exp(-(np.sum(dx**2, axis=-1)) / (2 * width**2)).squeeze()
 
         return s_2d / np.sum(s_2d)
 
@@ -359,7 +419,6 @@ class BatHeadDirectionSystem:
         self.n_conj_yaw, self.n_conj_pitch = config.n_conjunctive
         self.n_landmark = config.n_landmark
 
-        rng = np.random.default_rng(seed)
         self.yaw_ring = HeadDirectionNetwork(
             (self.n_yaw,),
             self.tau,
@@ -368,7 +427,7 @@ class BatHeadDirectionSystem:
             self.input_noise,
             config.size,
             use_single_bump=True,
-            rng=rng,
+            seed=seed,
         )
         self.pitch_ring = HeadDirectionNetwork(
             (self.n_pitch,),
@@ -378,15 +437,17 @@ class BatHeadDirectionSystem:
             self.input_noise,
             config.size,
             use_single_bump=True,
-            rng=rng,
+            seed=seed,
         )
 
         yaw_linspace = np.linspace(0, 360, self.n_conj_yaw, endpoint=False)
         pitch_linspace = np.linspace(
             *self.PITCH_RANGE, self.n_conj_pitch, endpoint=True
         )
-        self.conjunctive_angels = np.array(np.meshgrid(yaw_linspace, pitch_linspace)).T
-        self.visual_field = np.array((0.2, 0.1))
+        self.conjunctive_angels = np.stack(
+            [*np.meshgrid(yaw_linspace, pitch_linspace, indexing="ij")], axis=-1
+        )
+        self.visual_field = np.array((0.1, 0.1))
         self.connectivity_sigma = (
             np.array([1 / self.n_conj_yaw, 0.5 / self.n_conj_pitch]) * 2
         )
@@ -424,7 +485,7 @@ class BatHeadDirectionSystem:
         self._direct_w_yaw = None
         self._direct_w_pitch = None
 
-        self.conj_rng = np.random.default_rng(int(rng.integers(0, 2**32 - 1)))
+        self.conj_rng = np.random.default_rng(int(self.rng.integers(0, 2**32 - 1)))
 
         if self.feedback_mode == "direct":
             self._init_direct_weights()
@@ -440,7 +501,7 @@ class BatHeadDirectionSystem:
             size=(self.n_conj_yaw, self.n_conj_pitch, self.n_landmark)
         )
         self._conj_feedback_w /= (
-            self._conj_feedback_w.sum(axis=(0,1), keepdims=True) + self.eps
+            self._conj_feedback_w.sum(axis=(0, 1), keepdims=True) + self.eps
         )
         self._conj_feedback_w *= 0.1
 
@@ -470,7 +531,7 @@ class BatHeadDirectionSystem:
         self.pitch_ring.input_noise = self.input_noise
 
     def activation_weight_func(self, position, anchor):
-        err = angular_error(position, anchor)
+        err = relative_angular_error(position, anchor)
         d2 = err**2
         return np.exp(np.sum(-d2 / (2 * self.visual_field**2), axis=-1))
 
@@ -534,11 +595,10 @@ class BatHeadDirectionSystem:
         )
         self._conj_feedback_w += conj_feedback_weight_update
         self._conj_feedback_w /= np.clip(
-            np.sum(self._conj_feedback_w, axis=(0,1), keepdims=True),
+            np.sum(self._conj_feedback_w, axis=(0, 1), keepdims=True),
             1,
             None,
         )
-
 
     def step(
         self,
@@ -656,7 +716,6 @@ class BatHeadDirectionSystem:
             if step >= max_iter:
                 raise RuntimeError("Exceed the prescribed recursion depth")
             step += 1
-        print(f"Ran warm up for {step} steps")
 
     def run_simulation(
         self,
@@ -708,6 +767,7 @@ class BatHeadDirectionSystem:
                 output_dict["conj_feedback_w"] = np.zeros(
                     (record_steps, *self._conj_feedback_w.shape), dtype=float
                 )
+        output_dict["interval"] = interval
 
         range_generator = (
             tqdm(range(n_steps), desc="Running Simulation Steps")
