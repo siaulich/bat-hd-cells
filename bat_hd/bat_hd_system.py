@@ -128,7 +128,7 @@ class HeadDirectionNetwork:
 
         self.s = self.s + (self.dt / self.tau) * rate_derivatives + intrinsic_noise_term
 
-    def warm_up(self, tol=1e-5, max_iter=100000, initial_dir: np.ndarray = None):
+    def warm_up(self, initial_dir: np.ndarray = None, tol=1e-5, max_iter=100000):
         """Relax the network until consecutive states differ by less than ``tol``."""
         if initial_dir is not None:
             init_state = self.encode_orientation(initial_dir)
@@ -685,7 +685,7 @@ class BatHeadDirectionSystem:
         self.pitch_ring.step(v[1], anchor_input=pitch_fb)
 
     def warm_up(
-        self, tol=1e-5, max_iter=100000, initial_dir: np.ndarray = np.array([0, 0])
+        self,initial_dir: np.ndarray = np.array([0, 0]), tol=1e-5, max_iter=100000
     ):
         """Relax the network until consecutive states differ by less than ``tol``."""
         yaw_pos, pitch_pos = initial_dir[[0, 1]]
@@ -723,10 +723,11 @@ class BatHeadDirectionSystem:
         save_weights=False,
         interval=1,
         verbose=True,
+        use_anchor=True,
     ) -> Dict[str, np.ndarray]:
 
         v = bat_flight_data["dir_vel"]
-        dir = bat_flight_data.get("dir_sphere", None)
+        dir = bat_flight_data.get("dir_sphere", None) if use_anchor else None
         inverted = bat_flight_data.get("inverted", None)
 
         if v.ndim != 2 or v.shape[1] != 2:
